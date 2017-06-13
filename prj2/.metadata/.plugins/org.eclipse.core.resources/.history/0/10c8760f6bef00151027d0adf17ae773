@@ -1,0 +1,551 @@
+/*************************************************************************************
+			       DEPARTMENT OF ELECTRICAL AND ELECTRONIC ENGINEERING
+					   		     IMPERIAL COLLEGE LONDON 
+
+ 				      EE 3.19: Real Time Digital Signal Processing
+					       Dr Paul Mitcheson and Daniel Harvey
+
+				        		 PROJECT: Frame Processing
+
+ 				            ********* ENHANCE. C **********
+							 Shell for speech enhancement 
+
+  		Demonstrates overlap-add frame processing (interrupt driven) on the DSK. 
+
+ *************************************************************************************
+ 				             By Danny Harvey: 21 July 2006
+							 Updated for use on CCS v4 Sept 2010
+ ************************************************************************************/
+/*
+				Modified by Julia Booth and Patrick Engelbert 20 March 2016
+ */
+/**************************** Pre-processor statements ******************************/
+//  library required when using calloc
+#include <stdlib.h>
+//  Included so program can make use of DSP/BIOS configuration tool.  
+#include "dsp_bios_cfg.h"
+
+/* The file dsk6713.h must be included in every program that uses the BSL.  This
+   example also includes dsk6713_aic23.h because it uses the
+   AIC23 codec module (audio interface). */
+#include "dsk6713.h"
+#include "dsk6713_aic23.h"
+
+// math library (trig functions)
+#include <math.h>
+
+// timing library (CLK_gethtime function)
+#include <csl_timer.h>
+
+// file I/O library
+#include <stdio.h>
+
+/* Some functions to help with Complex algebra and FFT. */
+#include "cmplx.h"      
+#include "fft_functions.h"  
+
+// Some functions to help with writing/reading the audio ports when using interrupts.
+#include <helper_functions_ISR.h>
+
+#define WINCONST 0.85185			/* 0.46/0.54 for Hamming window */
+#define FSAMP 8000.0				/* sample frequency, ensure this matches Config for AIC */
+#define FFTLEN 256					/* fft length = frame length 256/8000 = 32 ms*/
+#define NFREQ (1+FFTLEN/2)			/* number of frequency bins from a real FFT */
+#define OVERSAMP 4					/* oversampling ratio (2 or 4) */  
+#define FRAMEINC (FFTLEN/OVERSAMP)	/* Frame increment */
+#define CIRCBUF (FFTLEN+FRAMEINC)	/* length of I/O buffers */
+
+#define NNOISEBLOCK 4				/* Number of noise blocks */
+#define NOISELEN 316				/* Number of frames for the noise window */
+#define NOISEBLOCKLEN (NOISELEN/NNOISEBLOCK)	/* Number of frames for each noise block */
+
+#define OUTGAIN 16000.0				/* Output gain for DAC */
+#define INGAIN  (1.0/16000.0)		/* Input gain for ADC  */
+// PI defined here for use in your code 
+#define PI 3.141592653589793
+#define TFRAME (FRAMEINC/FSAMP)       /* time between calculation of each frame */
+#define MINFREQ 0.05				  /* Minimum amplitude of a frequency bin */	  
+#define TAU (FFTLEN/FSAMP)			  /* Time constant for low pass filter */
+#define ALPHA 20					  /* Attenuation factor without filter */
+#define ALPHA_FILTER 4				  /* Attenuation factor with filter */
+#define MAXOVERSUBTRACTION 3		  /* maximum attenuation modifier for oversubtraction */
+#define MINOVERSUBTRACTION -1		  /* minimum attenuation modifier for oversubtraction */
+// deprecated #define OVERSUBTRACTIONCUTTOFF (FFTLEN/16)	/* Only first 32 frequency bins are modified*/
+#define LOWSNR 100					  /* Low snr threshold  20dB */
+
+#define LOGFILENAME "log.txt"		 /* Log file name */
+
+/********************************* MODE SELECTORS ***********************************/
+
+//#define FILTERED			// Lowpass filter Input in frequency domain
+#define FILTERED_POWER		// Lowpass filter input in power domain
+#define FILTERED_NOISE		// Lowpass filter noise estimate to avoid discontinuities
+//#define OVERSUBTRACTION		// Apply oversubtraction when output has low SNR
+//#define BENCHMARK			// Benchmark sections and generate log (do not use for realtime)
+
+/**************************** MODE SPECIFIC DEFINITIONS *****************************/
+
+#if defined(FILTERED) || defined(FILTERED_POWER)
+/* Modify ALPHA when using filtering */
+#if defined(ALPHA)
+#undef ALPHA
+#endif
+
+#define ALPHA ALPHA_FILTER
+#endif
+
+#if defined(OVERSUBTRACTION) && !defined(FELTERED) && !defined(FILTERED_POWER)
+// oversubtracton parameters rely on filter parameters to be used rather than default ones
+#undef OVERSUBTRACTION
+#endif
+
+#if defined(OVERSUBTRACTION)
+// Define oversubtraction function as a linearly decreasing between bounds over oversubtraction range
+#define OVERSUBTRACTIONDEC (MAXOVERSUBTRACTION/LOWSNR)
+#endif
+
+/********************************* MODE HELPERS *************************************/
+/* These prevent mutual exclusion errors (e.g. FILTERED and FILTERED_POWER cannot both
+ *  be active) */
+#if defined(FILTERED_POWER) && defined(FILTERED)
+#undef FILTERED
+#endif
+/******************************* Global declarations ********************************/
+
+/* Audio port configuration settings: these values set registers in the AIC23 audio
+   interface to configure it. See TI doc SLWS106D 3-3 to 3-10 for more info. */
+DSK6713_AIC23_Config Config = { \
+/**********************************************************************/
+/*   REGISTER	            FUNCTION			      SETTINGS         */
+/**********************************************************************/\
+0x0017,  /* 0 LEFTINVOL  Left line input channel volume  0dB                   */\
+0x0017,  /* 1 RIGHTINVOL Right line input channel volume 0dB                   */\
+0x01f9,  /* 2 LEFTHPVOL  Left channel headphone volume   0dB                   */\
+0x01f9,  /* 3 RIGHTHPVOL Right channel headphone volume  0dB                   */\
+0x0011,  /* 4 ANAPATH    Analog audio path control       DAC on, Mic boost 20dB*/\
+0x0000,  /* 5 DIGPATH    Digital audio path control      All Filters off       */\
+0x0000,  /* 6 DPOWERDOWN Power down control              All Hardware on       */\
+0x0043,  /* 7 DIGIF      Digital audio interface format  16 bit                */\
+0x008d,  /* 8 SAMPLERATE Sample rate control        8 KHZ-ensure matches FSAMP */\
+0x0001   /* 9 DIGACT     Digital interface activation    On                    */\
+/**********************************************************************/
+};
+
+// Codec handle:- a variable used to identify audio interface  
+DSK6713_AIC23_CodecHandle H_Codec;
+
+float *inBuffer, *outBuffer;   		/* Input/output circular buffers */
+float *inFrame, *outFrame;          /* Input and output frames */
+float *inWin, *outWin;              /* Input and output windows */
+float inGain, outGain;				/* ADC and DAC gains */
+complex *cBuffer;					/* Buffers for calculation */
+float *magnitude[OVERSAMP], *minMagnitude;		/* Buffers to store minimum noise */
+float *inFiltered, *noiseFiltered;	/* */
+float *lowSNR;						/* SNR in frequency bin */
+float cpuFrac; 						/* Fraction of CPU time used */
+volatile int ioPtr = 0;             /* Input/ouput pointer for circular buffers */
+volatile int framePtr = 0;          /* Frame pointer */
+volatile int noiseBlockPtr = 0;		/* Noise block pointer */
+volatile int frameIndex = 0;		/* Current frame pointer */
+float filterConst, remFilterConst;	/* precomputed constants for filter*/
+unsigned overhead, start, stop, sectionFFT,\
+			sectionIFFT, sectionFilter, sectionMin, sectionSub; /* Timings*/
+FILE *fp;							/* Log file */
+
+/******************************* Function prototypes *******************************/
+
+void initHardware(void);    		/* Initialize codec */
+void initHWI(void);					/* Initialize hardware interrupts */
+void ISR_AIC(void);					/* Interrupt service routine for codec */
+void processFrame(void);			/* Frame processing routine */
+void spectralSubtraction(int m);	/* Perform spectral subtraction at indexed frequency*/
+void filterInputs(int k);			/* Filter input at indexed frequency*/
+
+void toComplex(complex *out, float *in, int length);	/* Convert input to complex values */
+void toReal(float *out, complex *in, int length);		/* Convert input to real values */
+float min(float a, float b);							/* Find minimum of two numbers */
+float max(float a, float b);							/* Find maximum of two numbers */
+float clamp(float v, float min, float max);				/* Clamp value between two bounds */
+float sqr(float x);										/* Square a value */
+
+/********************************** Main routine ************************************/
+void main()
+{
+
+	int k; // used in various for loops
+
+	/*  Initialize and zero fill arrays */
+
+	inBuffer = (float *)calloc(CIRCBUF, sizeof(float));		/* Input array */
+	outBuffer = (float *)calloc(CIRCBUF, sizeof(float));	/* Output array */
+	inFrame = (float *)calloc(FFTLEN, sizeof(float));		/* Array for processing*/
+	outFrame = (float *)calloc(FFTLEN, sizeof(float));		/* Array for processing*/
+	inWin = (float *)calloc(FFTLEN, sizeof(float));			/* Input window */
+	outWin = (float *)calloc(FFTLEN, sizeof(float));		/* Output window */
+	cBuffer = (complex *)calloc(FFTLEN, sizeof(complex));	/* Complex Buffer for calculation */
+	inFiltered = (float *)calloc(FFTLEN, sizeof(float));	/* Array for filtered input */
+	noiseFiltered = (float *)calloc(FFTLEN, sizeof(float));	/* Array for filtered noise */
+	lowSNR = (float *)calloc(FFTLEN, sizeof(float));		/* Array for using oversubtraction */
+
+	minMagnitude = (float *)calloc(FFTLEN, sizeof(float));	/* Minimum noise estimate */
+	for (k = 0; k < FFTLEN; k++)
+		minMagnitude[k] = FLT_MAX;							/* Initialise the minimum magnitudes to be infinity */
+
+	for (k = 0; k < NNOISEBLOCK; k++)
+		magnitude[k] = (float *)calloc(FFTLEN, sizeof(float));	/* Create arrays for storing noise */
+
+	/* initialize board and the audio port */
+	initHardware();
+
+	/* initialize hardware interrupts */
+	initHWI();
+
+	/* initialize algorithm constants */
+	for (k = 0; k < FFTLEN; k++)
+	{
+		inWin[k] = sqrt((1.0 - WINCONST*cos(PI*(2 * k + 1) / FFTLEN)) / OVERSAMP);
+		outWin[k] = inWin[k];
+	}
+	inGain = INGAIN;
+	outGain = OUTGAIN;
+
+	/* Initialise filter constants */
+	filterConst = exp(-TFRAME / TAU);
+	remFilterConst = 1 - filterConst;
+
+#if defined(BENCHMARK)
+	/* Calculate overhead of retreiving timing information */
+	start = CLK_gethtime();
+	stop = CLK_gethtime();
+	overhead = stop - start;
+
+	/* Initialise file (will clear file if it exists) */
+	fp = fopen(LOGFILENAME, 'w');
+	fprintf(fp, "Noise Frame Index\t|Cycle FFT\t|Cycle Filter\t|Cycle sub\t|Cycle IFFT\n");
+	fclose(fp);
+#endif
+
+	/* main loop, wait for interrupt */
+	while (1) 	processFrame();
+}
+
+/********************************** init_hardware() *********************************/
+void initHardware()
+{
+	// Initialize the board support library, must be called first 
+	DSK6713_init();
+
+	// Start the AIC23 codec using the settings defined above in config 
+	H_Codec = DSK6713_AIC23_openCodec(0, &Config);
+
+	/* Function below sets the number of bits in word used by MSBSP (serial port) for
+	receives from AIC23 (audio port). We are using a 32 bit packet containing two
+	16 bit numbers hence 32BIT is set for  receive */
+	MCBSP_FSETS(RCR1, RWDLEN1, 32BIT);
+
+	/* Configures interrupt to activate on each consecutive available 32 bits
+	from Audio port hence an interrupt is generated for each L & R sample pair */
+	MCBSP_FSETS(SPCR1, RINTM, FRM);
+
+	/* These commands do the same thing as above but applied to data transfers to the
+	audio port */
+	MCBSP_FSETS(XCR1, XWDLEN1, 32BIT);
+	MCBSP_FSETS(SPCR1, XINTM, FRM);
+
+
+}
+/********************************** init_HWI() **************************************/
+void initHWI(void)
+{
+	IRQ_globalDisable();			// Globally disables interrupts
+	IRQ_nmiEnable();				// Enables the NMI interrupt (used by the debugger)
+	IRQ_map(IRQ_EVT_RINT1, 4);		// Maps an event to a physical interrupt
+	IRQ_enable(IRQ_EVT_RINT1);		// Enables the event
+	IRQ_globalEnable();				// Globally enables interrupts
+
+}
+
+/******************************** process_frame() ***********************************/
+void processFrame(void)
+{
+	int k, m;
+	int io_ptr0;
+
+	/* work out fraction of available CPU time used by algorithm */
+	cpuFrac = ((float)(ioPtr & (FRAMEINC - 1))) / FRAMEINC;
+
+	/* wait until io_ptr is at the start of the current frame */
+	while ((ioPtr / FRAMEINC) != framePtr);
+
+	/* then increment the framecount (wrapping if required) */
+	if (++framePtr >= (CIRCBUF / FRAMEINC)) framePtr = 0;
+
+	/* save a pointer to the position in the I/O buffers (inbuffer/outbuffer) where the
+	data should be read (inbuffer) and saved (outbuffer) for the purpose of processing */
+	io_ptr0 = framePtr * FRAMEINC;
+
+	/* copy input data from inbuffer into inframe (starting from the pointer position) */
+
+	m = io_ptr0;
+	for (k = 0; k < FFTLEN; k++)
+	{
+		inFrame[k] = inBuffer[m] * inWin[k];
+		if (++m >= CIRCBUF) m = 0; /* wrap if required */
+	}
+
+	/************************* DO PROCESSING OF FRAME  HERE **************************/
+
+#if defined(BENCHAMRK)
+	start = CLK_gethtime();
+#endif
+
+	/* Convert input frame to frequency domain */
+	toComplex(cBuffer, inFrame, FFTLEN);
+	fft(FFTLEN, cBuffer);
+
+#if defined(BENCHMARK)
+	stop = CLK_gethtime();
+	sectionFFT = stop - start - overhead;
+#endif
+
+	if (frameIndex == 0)
+	{
+		// If we are in the beginning of a noise frame, we need to recompute the minimum magnitude over all noise frames
+		for (k = 0; k < FFTLEN; k++)
+		{
+
+#if defined(BENCHMARK)
+			start = CLK_gethtime();
+#endif
+
+			filterInputs(k);
+
+#if defined(BENCHMARK)
+			stop = CLK_gethtime();
+			sectionFilter = stop - start - overhead;
+#endif
+
+			// No need to compare with current values
+			magnitude[noiseBlockPtr][k] = inFiltered[k];
+
+#if defined(BENCHMARK)
+			start = CLK_gethtime();
+#endif
+
+			// Do a full compute of the noise over 10 seconds as the current block may have held the minimum
+			minMagnitude[k] = min(magnitude[0][k], magnitude[1][k]);
+			minMagnitude[k] = min(minMagnitude[k], magnitude[2][k]);
+			minMagnitude[k] = min(minMagnitude[k], magnitude[3][k]);
+
+#if defined(BENCHMARK)
+			stop = CLK_gethtime();
+			sectionMin = stop - start - overhead;
+			start = CLK_gethtime();
+#endif	
+
+			spectralSubtraction(k);
+
+#if defined(BENCHMARK)
+			stop = CLK_gethtime();
+			sectionSub = stop - start - overhead;
+#endif
+
+		}
+	}
+	else
+	{
+		// If we aren't in the beginning of a noise frame, compare the fft and load the minimum in
+		for (k = 0; k < FFTLEN; k++)
+		{
+
+#if defined(BENCHMARK)
+			start = CLK_gethtime();
+#endif
+
+			filterInputs(k);
+
+#if defined(BENCHMARK)
+			stop = CLK_gethtime();
+			sectionFilter = stop - start - overhead;
+#endif	
+
+			// Compare the minimum with the minimum in current noise block
+			magnitude[noiseBlockPtr][k] = min(magnitude[noiseBlockPtr][k], inFiltered[k]);
+
+#if defined(BENCHMARK)
+			start = CLK_gethtime();
+#endif
+
+			// Only the current minimum may have changed so use min of old min and new value
+			minMagnitude[k] = min(minMagnitude[k], magnitude[noiseBlockPtr][k]);
+
+#if defined(BENCHMARK)
+			stop = CLK_gethtime();
+			sectionMin = stop - start - overhead;
+			start = CLK_gethtime();
+#endif
+
+			spectralSubtraction(k);
+
+#if defined(BENCHMARK)
+			stop = CLK_gethtime();
+			sectionSub = stop - start - overhead;
+#endif
+
+		}
+	}
+
+#if defined(BENCHMARK)
+	start = CLK_gethtime();
+#endif
+
+	// Convert frequency frame to time domain
+	ifft(FFTLEN, cBuffer);
+	toReal(outFrame, cBuffer, FFTLEN);
+
+#if defined(BENCHMARK)
+	stop = CLK_gethtime();
+	sectionIFFT = stop - start - overhead;
+
+	/* Print current timeings in log */
+	fp = fopen(LOGFILENAME, "a");
+	fprintf("%d/t/t/t/t|%d/t/t|%d/t/t|%d/t/t|%d/n", frameIndex, sectionFFT, sectionFilter, sectionMin, sectionSub, sectionIFFT);
+	fclose(fp);
+#endif
+
+	// Increment the current nosie frame index
+	if (++frameIndex >= NOISEBLOCKLEN)
+	{
+		frameIndex = 0;
+		if (++noiseBlockPtr >= NNOISEBLOCK) noiseBlockPtr = 0; // Move to next noise frame
+	}
+
+
+	/********************************************************************************/
+
+	/* multiply outframe by output window and overlap-add into output buffer */
+
+	m = io_ptr0;
+
+	for (k = 0; k < (FFTLEN - FRAMEINC); k++)
+	{    								/* this loop adds into outbuffer */
+		outBuffer[m] = outBuffer[m] + outFrame[k] * outWin[k];
+		if (++m >= CIRCBUF) m = 0; /* wrap if required */
+	}
+	for (; k < FFTLEN; k++)
+	{
+		outBuffer[m] = outFrame[k] * outWin[k];   /* this loop over-writes outbuffer */
+		m++;
+	}
+}
+
+/********************************* FILTER INPUTS  ***********************************/
+
+void filterInputs(int k)
+{
+#if defined(FILTERED)
+	// Low pass filter the input to avoid discontinuities and reduce musical noise
+	inFiltered[k] = (remFilterConst*cabs(cBuffer[k])) + (filterConst*inFiltered[k]);
+#elif defined(FILTERED_POWER)
+	// Low pass filter the input in frequency domain to avoid discontinuities and reduce musical noise
+	inFiltered[k] = sqrtf(fabs((remFilterConst*sqr(cabs(cBuffer[k]))) + (sqr(inFiltered[k])*filterConst)));
+#else
+	inFiltered[k] = cabs(cBuffer[k]);
+#endif
+}
+
+/************************* PERFORM SPECTRAL SUBTRACTION  *****************************/
+
+void spectralSubtraction(int m)
+{
+	// Assorted temporary values
+	float alphaValue, snr, attenuation;
+
+#if defined(FILTERED_NOISE)
+	// Low pass filter the noise estimate to avoid discontinuities
+	noiseFiltered[m] = (remFilterConst*minMagnitude[m]) + (filterConst*noiseFiltered[m]);
+#else
+	noiseFiltered[m] = minMagnitude[m];
+#endif
+	// Calculate |N(m)|/|X(m)|
+	attenuation = noiseFiltered[m] / inFiltered[m];
+#if defined(OVERSUBTRACTION)
+	// Calculate optimum alpha value dependant on SNR
+	if (lowSNR[m] <= LOWSNR)
+		alphaValue = clamp(ALPHA-(OVERSUBTRACTIONDEC*lowSNR[m]), ALPHA-MAXOVERSUBTRACTION, ALPHA-MINOVERSUBTRACTION);
+	else
+		alphaValue = ALPHA - MINOVERSUBTRACTION;
+#else
+	// Use default alpha value
+	alphaValue = ALPHA;
+#endif
+	// Calculate Y(m) = X(m)*G(m), where G(m)=max{lambda,1-alpha*(|N(m)|/|X(m)|)}
+	cBuffer[m] = rmul(max(MINFREQ, 1 - (alphaValue*attenuation)), cBuffer[m]);
+#if defined(OVERSUBTRACTION)
+	// Calculate SNR for current frequency bin
+	snr = sqr(cabs(cBuffer[m])) / sqr(noiseFiltered[m]);
+	// If snr is less than a threshold, activate low snr mode for that frequency bin
+	lowSNR[m] = snr;
+#endif
+}
+
+/*************************** INTERRUPT SERVICE ROUTINE  *****************************/
+
+// Map this to the appropriate interrupt in the CDB file
+
+void ISR_AIC(void)
+{
+	short sample;
+	/* Read and write the ADC and DAC using inbuffer and outbuffer */
+
+	sample = mono_read_16Bit();
+	inBuffer[ioPtr] = ((float)sample)*inGain;
+	/* write new output data */
+	mono_write_16Bit((int)(outBuffer[ioPtr] * outGain));
+
+	/* update io_ptr and check for buffer wraparound */
+	if (++ioPtr >= CIRCBUF) ioPtr = 0;
+}
+
+/********************************* HELPER FUNCTIONS *********************************/
+
+void toComplex(complex * out, float * in, int length)
+{
+	int i;
+	for (i = length - 1; i >= 0; i--)
+		// Convert all inputs to real part of a complex value
+		out[i] = cmplx(in[i], 0);
+}
+
+void toReal(float * out, complex * in, int length)
+{
+	int i;
+	for (i = length - 1; i >= 0; i--)
+		// Extract only real parts of complex values
+		out[i] = in[i].r;
+}
+
+float min(float a, float b)
+{
+	// Hopefully the compiler will have good optimisation for ternaries
+	return a < b ? a : b;
+}
+
+float max(float a, float b)
+{
+	// Hopefully the compiler will have good optimisation for ternaries
+	return a > b ? a : b;
+}
+
+float clamp(float v, float min, float max)
+{
+	// Hopefully the compiler will have good optimisation for ternaries
+	return v <= min ? min : v >= max ? max : v;
+}
+
+float sqr(float x)
+{
+	return x*x;
+}
+
+/***********************************************************************************/

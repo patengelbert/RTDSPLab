@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<States>
+<Expressions>
+<Expression IMemento.internal.id="lowSNR[m]">
+<Format/>
+</Expression>
+<Expression IMemento.internal.id="noiseFiltered[m]">
+<Format/>
+</Expression>
+<Expression IMemento.internal.id="frameIndex">
+<Format/>
+</Expression>
+<Expression IMemento.internal.id="cBuffer[m]">
+<Format/>
+</Expression>
+<Expression IMemento.internal.id="alphaValue">
+<Format/>
+</Expression>
+<Expression IMemento.internal.id="fp">
+<Format/>
+</Expression>
+<Expression IMemento.internal.id="overhead">
+<Format/>
+</Expression>
+</Expressions>
+</States>
